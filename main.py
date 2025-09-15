@@ -5,7 +5,9 @@ from datetime import datetime, time
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-import yfinance as yf
+import requests
+import json
+import os
 
 # Setup logging
 logging.basicConfig(
@@ -16,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # Konfigurasi
 TOKEN = "7986346335:AAHwnOObwky-Hz4z5uYgaGIH1D84sJqualw"
-CHAT_ID = "5279114407"  # Hanya chat ID Anda yang bisa terima notifikasi
+CHAT_ID = "5279114407"
 WIB = pytz.timezone('Asia/Jakarta')
 
 class BBRIBot:
@@ -37,11 +39,9 @@ class BBRIBot:
             current_time = now.time()
             current_day = now.weekday()
             
-            # Weekend check (0-4 = Senin-Jumat)
             if current_day >= 5:
                 return False
                 
-            # Market hours check (09:00-16:00 WIB)
             market_open = time(9, 0)
             market_close = time(16, 0)
             
@@ -50,30 +50,91 @@ class BBRIBot:
             logger.error(f"Error checking market hours: {e}")
             return False
     
-    async def get_brri_price(self):
-        """Ambil harga saham BBRI saja"""
+    async def get_brri_price_alpha(self):
+        """Gunakan Alpha Vantage API (lebih reliable)"""
         try:
-            stock = yf.Ticker("BBRI.JK")
-            history = stock.history(period="1d")
+            # Alpha Vantage free API key
+            api_key = "demo"  # Ganti dengan API key sendiri jika perlu
+            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=BBRI.JK&apikey={api_key}"
             
-            if not history.empty:
-                current_price = history['Close'].iloc[-1]
-                return f"{current_price:,.0f}"
-            else:
-                return "N/A"
+            async with self.session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if 'Global Quote' in data and data['Global Quote']:
+                        quote = data['Global Quote']
+                        price = quote.get('05. price', 'N/A')
+                        return price
+            return None
+        except Exception as e:
+            logger.error(f"Alpha Vantage error: {e}")
+            return None
+    
+    async def get_brri_price_marketstack(self):
+        """Gunakan Marketstack API"""
+        try:
+            api_key = "demo"  # Free tier
+            url = f"http://api.marketstack.com/v1/eod/latest?symbols=BBRI.JK&access_key={api_key}"
+            
+            async with self.session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('data'):
+                        stock_data = data['data'][0]
+                        price = stock_data.get('close', 'N/A')
+                        return price
+            return None
+        except Exception as e:
+            logger.error(f"Marketstack error: {e}")
+            return None
+    
+    async def get_brri_price_fallback(self):
+        """Fallback: IDX API atau sumber lain"""
+        try:
+            # Coba IDX API
+            url = "https://www.idx.co.id/umbraco/Surface/StockData/GetSecuritiesStock?code=BBRI"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            async with self.session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data and len(data) > 0:
+                        price = data[0].get('Price', 'N/A')
+                        return price
+            return None
+        except Exception as e:
+            logger.error(f"Fallback error: {e}")
+            return None
+    
+    async def get_brri_price(self):
+        """Ambil harga dengan multiple fallback"""
+        try:
+            # Coba berbagai API berurutan
+            apis = [
+                self.get_brri_price_alpha,
+                self.get_brri_price_marketstack,
+                self.get_brri_price_fallback
+            ]
+            
+            for api in apis:
+                price = await api()
+                if price and price != 'N/A':
+                    return f"{float(price):,.0f}"
+                await asyncio.sleep(1)  # Jeda antar requests
                         
+            return "N/A"
         except Exception as e:
             logger.error(f"Error fetching stock price: {e}")
             return "Error"
     
     async def send_telegram_message(self, message):
-        """Kirim pesan ke Telegram - HANYA untuk chat ID Anda"""
+        """Kirim pesan ke Telegram"""
         try:
             url = f"{self.bot_url}/sendMessage"
             payload = {
-                'chat_id': CHAT_ID,  # Hanya kirim ke chat ID Anda
-                'text': message,
-                'parse_mode': 'HTML'
+                'chat_id': CHAT_ID,
+                'text': message
             }
             
             async with self.session.post(url, json=payload) as response:
@@ -89,22 +150,21 @@ class BBRIBot:
             return False
     
     async def send_price_update(self):
-        """Kirim update harga simple seperti bot SOL"""
+        """Kirim update harga simple"""
         try:
             if self.is_market_hours():
                 price = await self.get_brri_price()
                 message = f"BBRI Price\n{price}"
                 await self.send_telegram_message(message)
             else:
-                # Diluar jam bursa, tidak kirim apa-apa (silent)
+                # Diluar jam bursa, tidak kirim apa-apa
                 pass
         except Exception as e:
             logger.error(f"❌ Error in price update: {e}")
     
     def setup_scheduler(self):
-        """Setup scheduler untuk mengirim harga setiap menit"""
+        """Setup scheduler"""
         try:
-            # Kirim setiap menit dari Senin-Jumat (09:00-15:59)
             trigger = CronTrigger(
                 day_of_week='mon-fri',
                 hour='9-15',
@@ -131,13 +191,12 @@ class BBRIBot:
             self.scheduler.start()
             
             logger.info("🤖 BBRI Price Bot Started!")
-            logger.info("📊 Akan kirim harga setiap menit (09:00-16:00 WIB, Senin-Jumat)")
             
             # Kirim pesan startup
             startup_msg = "🤖 BBRI Price Bot Started!\n⏰ Akan kirim harga setiap menit selama jam bursa"
             await self.send_telegram_message(startup_msg)
             
-            # Keep running forever
+            # Keep running
             while True:
                 await asyncio.sleep(3600)
                 

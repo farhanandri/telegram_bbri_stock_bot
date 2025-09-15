@@ -20,7 +20,7 @@ TOKEN = "7986346335:AAHwnOObwky-Hz4z5uYgaGIH1D84sJqualw"
 CHAT_ID = "5279114407"
 WIB = pytz.timezone('Asia/Jakarta')
 
-class BBRIBot:
+class StockBot:
     def __init__(self):
         self.scheduler = AsyncIOScheduler(timezone=WIB)
         self.bot_url = f"https://api.telegram.org/bot{TOKEN}"
@@ -49,10 +49,10 @@ class BBRIBot:
             logger.error(f"Error checking market hours: {e}")
             return False
     
-    async def get_brri_price_yahoo(self):
-        """Ambil harga langsung dari Yahoo Finance API"""
+    async def get_stock_price_yahoo(self, symbol):
+        """Ambil harga saham dari Yahoo Finance API"""
         try:
-            url = "https://query1.finance.yahoo.com/v8/finance/chart/BBRI.JK"
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 'Accept': 'application/json'
@@ -61,9 +61,6 @@ class BBRIBot:
             async with self.session.get(url, headers=headers, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
-                    
-                    # Debug: Lihat struktur response
-                    logger.info(f"Yahoo API Response: {json.dumps(data)[:200]}...")
                     
                     result = data.get('chart', {}).get('result', [])
                     if result:
@@ -74,13 +71,13 @@ class BBRIBot:
                             return regular_market_price
             return None
         except Exception as e:
-            logger.error(f"Yahoo API error: {e}")
+            logger.error(f"Yahoo API error for {symbol}: {e}")
             return None
     
-    async def get_brri_price_google(self):
+    async def get_stock_price_google(self, symbol):
         """Alternative: Google Finance"""
         try:
-            url = "https://www.google.com/finance/quote/BBRI:IDX"
+            url = f"https://www.google.com/finance/quote/{symbol}:IDX"
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
@@ -90,38 +87,48 @@ class BBRIBot:
                     html = await response.text()
                     
                     # Cari harga dalam HTML
-                    if 'BBRI' in html:
-                        # Cari pattern harga
-                        import re
-                        price_pattern = r'\"(\d+\.\d+)\"'
-                        matches = re.findall(price_pattern, html)
-                        
-                        for match in matches:
-                            price = float(match)
-                            if 1000 < price < 10000:  # Filter reasonable price range
-                                return price
+                    import re
+                    price_pattern = r'\"(\d+\.\d+)\"'
+                    matches = re.findall(price_pattern, html)
+                    
+                    for match in matches:
+                        price = float(match)
+                        if 100 < price < 10000:  # Filter reasonable price range
+                            return price
             return None
         except Exception as e:
-            logger.error(f"Google Finance error: {e}")
+            logger.error(f"Google Finance error for {symbol}: {e}")
             return None
     
-    async def get_brri_price(self):
-        """Ambil harga dengan multiple fallback"""
+    async def get_stock_price(self, symbol):
+        """Ambil harga saham dengan multiple fallback"""
         try:
             # Coba Yahoo Finance dulu
-            price = await self.get_brri_price_yahoo()
+            price = await self.get_stock_price_yahoo(symbol)
             if price:
                 return f"{price:,.0f}"
             
             # Fallback ke Google Finance
-            price = await self.get_brri_price_google()
+            price = await self.get_stock_price_google(symbol)
             if price:
                 return f"{price:,.0f}"
                         
             return "N/A"
         except Exception as e:
-            logger.error(f"Error fetching stock price: {e}")
+            logger.error(f"Error fetching {symbol} price: {e}")
             return "Error"
+    
+    async def get_all_prices(self):
+        """Ambil harga untuk semua saham"""
+        try:
+            # Ambil harga BBRI dan CDIA secara bersamaan
+            bbri_price = await self.get_stock_price("BBRI.JK")
+            cdia_price = await self.get_stock_price("CDIA.JK")
+            
+            return bbri_price, cdia_price
+        except Exception as e:
+            logger.error(f"Error getting all prices: {e}")
+            return "Error", "Error"
     
     async def send_telegram_message(self, message):
         """Kirim pesan ke Telegram"""
@@ -129,7 +136,8 @@ class BBRIBot:
             url = f"{self.bot_url}/sendMessage"
             payload = {
                 'chat_id': CHAT_ID,
-                'text': message
+                'text': message,
+                'parse_mode': 'HTML'
             }
             
             async with self.session.post(url, json=payload) as response:
@@ -145,15 +153,36 @@ class BBRIBot:
             return False
     
     async def send_price_update(self):
-        """Kirim update harga simple"""
+        """Kirim update harga untuk semua saham"""
         try:
             if self.is_market_hours():
-                price = await self.get_brri_price()
-                message = f"BBRI Price\n{price}"
+                bbri_price, cdia_price = await self.get_all_prices()
+                
+                # Format pesan dengan emoticon menarik
+                message = (
+                    f"🚀 <b>STOCK UPDATE</b> 🚀\n\n"
+                    f"🏦 <b>BBRI</b>: <code>Rp {bbri_price}</code>\n"
+                    f"💎 <b>CDIA</b>: <code>Rp {cdia_price}</code>\n\n"
+                    f"⏰ {datetime.now(WIB).strftime('%H:%M:%S')} WIB\n"
+                    f"📅 {datetime.now(WIB).strftime('%d/%m/%Y')}"
+                )
+                
                 success = await self.send_telegram_message(message)
                 
                 if not success:
-                    logger.error("Failed to send Telegram message")
+                    # Fallback tanpa HTML
+                    fallback_msg = (
+                        f"STOCK UPDATE\n\n"
+                        f"BBRI: Rp {bbri_price}\n"
+                        f"CDIA: Rp {cdia_price}\n\n"
+                        f"Waktu: {datetime.now(WIB).strftime('%H:%M:%S')} WIB"
+                    )
+                    payload = {
+                        'chat_id': CHAT_ID,
+                        'text': fallback_msg
+                    }
+                    async with self.session.post(self.bot_url + "/sendMessage", json=payload):
+                        pass
             else:
                 # Diluar jam bursa, tidak kirim apa-apa
                 pass
@@ -174,7 +203,7 @@ class BBRIBot:
                 self.send_price_update,
                 trigger=trigger,
                 max_instances=1,
-                name='bbri_price_update'
+                name='stock_price_update'
             )
             
             logger.info("✅ Scheduler setup completed")
@@ -188,10 +217,17 @@ class BBRIBot:
             self.setup_scheduler()
             self.scheduler.start()
             
-            logger.info("🤖 BBRI Price Bot Started!")
+            logger.info("🤖 Stock Price Bot Started!")
+            logger.info("📊 Monitoring: BBRI & CDIA")
+            logger.info("⏰ Schedule: Senin-Jumat, 09:00-16:00 WIB")
             
             # Kirim pesan startup
-            startup_msg = "🤖 BBRI Price Bot Started!\n⏰ Akan kirim harga setiap menit selama jam bursa"
+            startup_msg = (
+                "🤖 <b>Stock Price Bot Started!</b>\n\n"
+                "📊 <b>Monitoring:</b> BBRI & CDIA\n"
+                "⏰ <b>Schedule:</b> Setiap menit (09:00-16:00 WIB)\n"
+                "✅ <b>Status:</b> Active"
+            )
             await self.send_telegram_message(startup_msg)
             
             # Test langsung
@@ -208,7 +244,7 @@ class BBRIBot:
                 await self.session.close()
 
 async def main():
-    bot = BBRIBot()
+    bot = StockBot()
     await bot.run()
 
 if __name__ == "__main__":

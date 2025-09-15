@@ -5,7 +5,6 @@ from datetime import datetime, time
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-import requests
 import json
 import os
 
@@ -50,78 +49,74 @@ class BBRIBot:
             logger.error(f"Error checking market hours: {e}")
             return False
     
-    async def get_brri_price_alpha(self):
-        """Gunakan Alpha Vantage API (lebih reliable)"""
+    async def get_brri_price_yahoo(self):
+        """Ambil harga langsung dari Yahoo Finance API"""
         try:
-            # Alpha Vantage free API key
-            api_key = "demo"  # Ganti dengan API key sendiri jika perlu
-            url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=BBRI.JK&apikey={api_key}"
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/BBRI.JK"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
             
-            async with self.session.get(url, timeout=10) as response:
+            async with self.session.get(url, headers=headers, timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if 'Global Quote' in data and data['Global Quote']:
-                        quote = data['Global Quote']
-                        price = quote.get('05. price', 'N/A')
-                        return price
+                    
+                    # Debug: Lihat struktur response
+                    logger.info(f"Yahoo API Response: {json.dumps(data)[:200]}...")
+                    
+                    result = data.get('chart', {}).get('result', [])
+                    if result:
+                        meta = result[0].get('meta', {})
+                        regular_market_price = meta.get('regularMarketPrice')
+                        
+                        if regular_market_price:
+                            return regular_market_price
             return None
         except Exception as e:
-            logger.error(f"Alpha Vantage error: {e}")
+            logger.error(f"Yahoo API error: {e}")
             return None
     
-    async def get_brri_price_marketstack(self):
-        """Gunakan Marketstack API"""
+    async def get_brri_price_google(self):
+        """Alternative: Google Finance"""
         try:
-            api_key = "demo"  # Free tier
-            url = f"http://api.marketstack.com/v1/eod/latest?symbols=BBRI.JK&access_key={api_key}"
-            
-            async with self.session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('data'):
-                        stock_data = data['data'][0]
-                        price = stock_data.get('close', 'N/A')
-                        return price
-            return None
-        except Exception as e:
-            logger.error(f"Marketstack error: {e}")
-            return None
-    
-    async def get_brri_price_fallback(self):
-        """Fallback: IDX API atau sumber lain"""
-        try:
-            # Coba IDX API
-            url = "https://www.idx.co.id/umbraco/Surface/StockData/GetSecuritiesStock?code=BBRI"
+            url = "https://www.google.com/finance/quote/BBRI:IDX"
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
             async with self.session.get(url, headers=headers, timeout=10) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    if data and len(data) > 0:
-                        price = data[0].get('Price', 'N/A')
-                        return price
+                    html = await response.text()
+                    
+                    # Cari harga dalam HTML
+                    if 'BBRI' in html:
+                        # Cari pattern harga
+                        import re
+                        price_pattern = r'\"(\d+\.\d+)\"'
+                        matches = re.findall(price_pattern, html)
+                        
+                        for match in matches:
+                            price = float(match)
+                            if 1000 < price < 10000:  # Filter reasonable price range
+                                return price
             return None
         except Exception as e:
-            logger.error(f"Fallback error: {e}")
+            logger.error(f"Google Finance error: {e}")
             return None
     
     async def get_brri_price(self):
         """Ambil harga dengan multiple fallback"""
         try:
-            # Coba berbagai API berurutan
-            apis = [
-                self.get_brri_price_alpha,
-                self.get_brri_price_marketstack,
-                self.get_brri_price_fallback
-            ]
+            # Coba Yahoo Finance dulu
+            price = await self.get_brri_price_yahoo()
+            if price:
+                return f"{price:,.0f}"
             
-            for api in apis:
-                price = await api()
-                if price and price != 'N/A':
-                    return f"{float(price):,.0f}"
-                await asyncio.sleep(1)  # Jeda antar requests
+            # Fallback ke Google Finance
+            price = await self.get_brri_price_google()
+            if price:
+                return f"{price:,.0f}"
                         
             return "N/A"
         except Exception as e:
@@ -155,7 +150,10 @@ class BBRIBot:
             if self.is_market_hours():
                 price = await self.get_brri_price()
                 message = f"BBRI Price\n{price}"
-                await self.send_telegram_message(message)
+                success = await self.send_telegram_message(message)
+                
+                if not success:
+                    logger.error("Failed to send Telegram message")
             else:
                 # Diluar jam bursa, tidak kirim apa-apa
                 pass
@@ -195,6 +193,9 @@ class BBRIBot:
             # Kirim pesan startup
             startup_msg = "🤖 BBRI Price Bot Started!\n⏰ Akan kirim harga setiap menit selama jam bursa"
             await self.send_telegram_message(startup_msg)
+            
+            # Test langsung
+            await self.send_price_update()
             
             # Keep running
             while True:
